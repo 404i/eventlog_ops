@@ -26,15 +26,15 @@ apt_hunter_log="$log_folder/${folder_name}_apt_hunter.log"
 chainsaw_log="$log_folder/${folder_name}_chainsaw.log"
 
 # Execute hayabusa in the background and redirect stdout to log file and report file
-/home/tsochkata/git/hayabusa/./hayabusa-2.5.1-lin-gnu csv-timeline --ISO-8601 -t 20 --UTC -q -d "$PWD" -o "$hayabusa_report" > "$hayabusa_log" 2>&1 &
+/home/<USER>/git/hayabusa/./hayabusa-2.5.1-lin-gnu csv-timeline --ISO-8601 -t 20 --UTC -q -d "$PWD" -o "$hayabusa_report" > "$hayabusa_log" 2>&1 &
 hayabusa_pid=$!
 
 # Execute apt-hunter in the background and redirect stdout to log file and report file
-python3 /home/tsochkata/git/APT-Hunter-main/APT-Hunter.py -p "$PWD" -cores 20 -tz UTC -allreport -o "$apt_hunter_report" > "$apt_hunter_log" 2>&1 &
+python3 /home/<USER>/git/APT-Hunter-main/APT-Hunter.py -p "$PWD" -cores 20 -tz UTC -allreport -o "$apt_hunter_report" > "$apt_hunter_log" 2>&1 &
 apt_hunter_pid=$!
 
 # Execute chainsaw and redirect stdout to log file and report file
-/home/tsochkata/git/chainsaw/target/release/./chainsaw hunt "$PWD" -s /home/tsochkata/git/sigma --mapping /home/tsochkata/git/chainsaw/mappings/sigma-event-logs-all.yml -r /home/tsochkata/git/chainsaw/rules --timezone UTC --full --csv "$chainsaw_report" > "$chainsaw_log" 2>&1 &
+/home/<USER>/git/chainsaw/target/release/./chainsaw hunt "$PWD" -s /home/tsochkata/git/sigma --mapping /home/tsochkata/git/chainsaw/mappings/sigma-event-logs-all.yml -r /home/tsochkata/git/chainsaw/rules --timezone UTC --full --csv "$chainsaw_report" > "$chainsaw_log" 2>&1 &
 chainsaw_pid=$!
 
 # Function to display tool completion status

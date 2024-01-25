@@ -8,7 +8,7 @@ https://github.com/Yamato-Security/hayabusa
 
 https://github.com/WithSecureLabs/chainsaw
 
-https://github.com/ahmedkhlief/APT-Hunter/releases/tag/V3.0
+https://github.com/ahmedkhlief/APT-Hunter/
 
 You may need to ammend the path to the tools in the script as their versions change.
 

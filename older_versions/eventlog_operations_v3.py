@@ -45,7 +45,7 @@ def display_completion_status(tool_name, returncode):
         print(f"[{tool_name}] Tool has failed with return code: {returncode}")
 
 # Execute hayabusa in the background and redirect stdout to log file and report file
-hayabusa_cmd = f"/home/{os.environ['USER']}/git/hayabusa/./hayabusa-2.5.1-lin-gnu csv-timeline --ISO-8601 -t 20 --UTC -q -d \"{os.getcwd()}\" -o \"{hayabusa_report}\" > \"{hayabusa_log}\" 2>&1"
+hayabusa_cmd = f"/home/{os.environ['USER']}/git/hayabusa/./hayabusa csv-timeline --ISO-8601 -t 20 --UTC -q -d \"{os.getcwd()}\" --no-wizard -o \"{hayabusa_report}\" > \"{hayabusa_log}\" 2>&1"
 hayabusa_process = subprocess.Popen(hayabusa_cmd, shell=True)
 
 # Execute apt-hunter in the background and redirect stdout to log file and report file

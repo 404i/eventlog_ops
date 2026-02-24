@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -60,8 +61,6 @@ def colorize_confidence(value: str) -> str:
         return colorize(value, COLOR_GREEN)
     return value
 
-# from tqdm import tqdm
-
 # Locate configuration alongside script or executable
 try:
     CONFIG_ROOT = Path(__file__).resolve().parent
@@ -69,6 +68,17 @@ except NameError:
     CONFIG_ROOT = Path(sys.argv[0]).resolve().parent
 
 CONFIG_FILE = CONFIG_ROOT / "eventlog_tools.ini"
+
+CONTAINER_TOOL_DEFAULTS = {
+    "hayabusa": "/opt/hayabusa/hayabusa",
+    "hayabusa_rules": "/opt/hayabusa/rules",
+    "apt_hunter": "/opt/apt-hunter/APT-Hunter.py",
+    "apt_hunter_python": "/opt/apt-hunter/.venv/bin/python",
+    "chainsaw": "/opt/chainsaw/chainsaw",
+    "sigma": "/opt/sigma/rules",
+    "mapping": "/opt/chainsaw/mappings/sigma-event-logs-all.yml",
+    "chainsaw_rules": "/opt/chainsaw/rules",
+}
 
 DEFAULT_LLM_SETTINGS = {
     "enabled": "false",
@@ -87,6 +97,28 @@ DEFAULT_LLM_SETTINGS = {
 def save_config(config: configparser.ConfigParser) -> None:
     with CONFIG_FILE.open("w", encoding="utf-8") as config_file:
         config.write(config_file)
+
+
+def auto_configure() -> configparser.ConfigParser:
+    """Write configuration from environment variables or built-in container defaults without prompting."""
+    paths = {
+        key: Path(os.environ.get(f"EVENTLOG_{key.upper()}", default))
+        for key, default in CONTAINER_TOOL_DEFAULTS.items()
+    }
+    llm_settings: Dict[str, str] = DEFAULT_LLM_SETTINGS.copy()
+    endpoint = os.environ.get("LLM_ENDPOINT", "")
+    if endpoint:
+        llm_settings["enabled"] = "true"
+        llm_settings["endpoint"] = endpoint
+    model = os.environ.get("LLM_MODEL", "")
+    if model:
+        llm_settings["model"] = model
+    config = configparser.ConfigParser()
+    config["tools"] = {key: str(value) for key, value in paths.items()}
+    config["llm"] = llm_settings
+    save_config(config)
+    logging.debug("Auto-configuration written to %s", CONFIG_FILE)
+    return config
 
 
 @dataclass
@@ -149,6 +181,7 @@ def collect_configuration() -> configparser.ConfigParser:
 
     defaults = {
         "hayabusa": hayabusa_default,
+        "hayabusa_rules": hayabusa_default.parent / "rules",
         "apt_hunter": apt_hunter_root / "APT-Hunter.py",
         "apt_hunter_python": apt_hunter_root / ".venv" / "bin" / "python",
         "chainsaw": chainsaw_default,
@@ -159,6 +192,7 @@ def collect_configuration() -> configparser.ConfigParser:
 
     paths = {}
     paths["hayabusa"] = prompt_for_path("Path to hayabusa binary", defaults["hayabusa"])
+    paths["hayabusa_rules"] = prompt_for_path("Path to hayabusa rules directory", defaults["hayabusa_rules"])
     paths["apt_hunter"] = prompt_for_path("Path to APT-Hunter.py", defaults["apt_hunter"])
     paths["apt_hunter_python"] = prompt_for_path(
         "Python interpreter to run APT-Hunter", defaults["apt_hunter_python"]
@@ -204,15 +238,18 @@ def collect_configuration() -> configparser.ConfigParser:
     return config
 
 
-def load_configuration() -> configparser.ConfigParser:
+def load_configuration(auto: bool = False) -> configparser.ConfigParser:
     config = configparser.ConfigParser()
     if not CONFIG_FILE.exists():
+        if auto or os.environ.get("EVENTLOG_AUTO_CONFIG", "").lower() in {"1", "true", "yes"}:
+            return auto_configure()
         return collect_configuration()
 
     config.read(CONFIG_FILE, encoding="utf-8")
 
     required_tool_keys = {
         "hayabusa",
+        "hayabusa_rules",
         "apt_hunter",
         "apt_hunter_python",
         "chainsaw",
@@ -324,6 +361,33 @@ def parse_args() -> argparse.Namespace:
         "--debug-log",
         type=Path,
         help="Optional path to write detailed debug logs.",
+    )
+    parser.add_argument(
+        "--tool-timeout",
+        type=int,
+        default=None,
+        metavar="SECONDS",
+        help="Kill any tool still running after this many seconds (default: no limit).",
+    )
+    parser.add_argument(
+        "--auto-config",
+        action="store_true",
+        help="Write configuration from EVENTLOG_* env vars or container defaults without prompting.",
+    )
+    parser.add_argument(
+        "--skip-hayabusa",
+        action="store_true",
+        help="Skip the Hayabusa step.",
+    )
+    parser.add_argument(
+        "--skip-apt-hunter",
+        action="store_true",
+        help="Skip the APT-Hunter step.",
+    )
+    parser.add_argument(
+        "--skip-chainsaw",
+        action="store_true",
+        help="Skip the Chainsaw step.",
     )
     return parser.parse_args()
 
@@ -564,12 +628,26 @@ def prepare_tools(
     report_folder: Path,
     log_folder: Path,
     tool_paths: dict,
+    skip_hayabusa: bool = False,
+    skip_apt_hunter: bool = False,
+    skip_chainsaw: bool = False,
 ) -> List[ToolRun]:
     hayabusa_report_path = report_folder / f"{folder_name}_hayabusa_output.csv"
     apt_hunter_prefix = report_folder / f"{folder_name}_apt_hunter_output"
-    apt_hunter_report_path = Path(str(apt_hunter_prefix) + "_Report.xlsx")
+    # APT-Hunter's create_out_dir() does `return output + "/" + output`, so with
+    # `-o out` (relative) run from /tmp/ahwork, the return value is `out/out` and
+    # APT-Hunter creates the `out/out/` subdir then writes files to the PARENT `out/`.
+    # So actual output files land at /tmp/ahwork/out/out_Report.xlsx etc.
+    # We pre-create /tmp/ahwork/out/out/ so create_out_dir succeeds, then copy from out/.
+    # APT-Hunter's hardcoded relative temp_dir="temp" will land at /tmp/ahwork/temp (safe).
+    _apt_hunter_workdir = "/tmp/ahwork"
+    _apt_hunter_o = "out"          # relative -o arg, passed from CWD=/tmp/ahwork
+    _apt_hunter_tmp_results = f"{_apt_hunter_workdir}/{_apt_hunter_o}"  # files land here
+    _apt_hunter_subdirfix = f"{_apt_hunter_tmp_results}/{_apt_hunter_o}"  # pre-create this so create_out_dir succeeds
+    _apt_hunter_basename = _apt_hunter_o   # matches the -o basename
+    apt_hunter_report_path = apt_hunter_prefix / f"{_apt_hunter_basename}_Report.xlsx"
     apt_hunter_additional = [
-        Path(str(apt_hunter_prefix) + suffix)
+        apt_hunter_prefix / f"{_apt_hunter_basename}{suffix}"
         for suffix in [
             "_TimeSketch.csv",
             "_Logon_Events.csv",
@@ -584,13 +662,26 @@ def prepare_tools(
 
     hayabusa_cmd = (
         f"{shlex.quote(str(tool_paths['hayabusa']))} csv-timeline --ISO-8601 -t 20 --UTC -q --no-wizard "
+        f"-r {shlex.quote(str(tool_paths['hayabusa_rules']))} "
         f"-d {shlex.quote(str(target_dir))} -o {shlex.quote(str(hayabusa_report_path))} > {shlex.quote(str(hayabusa_log_path))} 2>&1"
     )
 
+     # APT-Hunter uses multiprocessing which deadlocks in Docker-on-macOS when given a
+    # directory.  Running per-file (one EVTX at a time) avoids the deadlock.
+    # create_out_dir("-o out") from CWD=/tmp/ahwork returns "out/out", writing files to
+    # /tmp/ahwork/out/out_Report.xlsx. We pre-create that path then copy to apt_hunter_prefix.
+    # APT-Hunter's hardcoded relative temp_dir="temp" will land at /tmp/ahwork/temp (safe).
     apt_hunter_cmd = (
+        f"{{ "
+        f"mkdir -p {_apt_hunter_subdirfix} {shlex.quote(str(apt_hunter_prefix))} && "
+        f"cd {_apt_hunter_workdir} && "
+        f"for _evtx in {shlex.quote(str(target_dir))}/*.evtx; do "
         f"{shlex.quote(str(tool_paths['apt_hunter_python']))} {shlex.quote(str(tool_paths['apt_hunter']))} "
-        f"-p {shlex.quote(str(target_dir))} -cores 20 -tz UTC -allreport "
-        f"-o {shlex.quote(str(apt_hunter_prefix))} > {shlex.quote(str(apt_hunter_log_path))} 2>&1"
+        f"-p \"$_evtx\" -tz UTC -allreport "
+        f"-o {_apt_hunter_o}; "
+        f"done && "
+        f"cp -f {_apt_hunter_tmp_results}/{_apt_hunter_basename}_* {shlex.quote(str(apt_hunter_prefix))}/; "
+        f"}} > {shlex.quote(str(apt_hunter_log_path))} 2>&1"
     )
 
     chainsaw_cmd = (
@@ -612,10 +703,41 @@ def prepare_tools(
         ToolRun("chainsaw", chainsaw_cmd, chainsaw_log_path, chainsaw_report_path),
     ]
 
+    if skip_hayabusa:
+        tool_runs = [t for t in tool_runs if t.name != "hayabusa"]
+        logging.debug("Skipping hayabusa (--skip-hayabusa)")
+    if skip_apt_hunter:
+        tool_runs = [t for t in tool_runs if t.name != "apt-hunter"]
+        logging.debug("Skipping apt-hunter (--skip-apt-hunter)")
+    if skip_chainsaw:
+        tool_runs = [t for t in tool_runs if t.name != "chainsaw"]
+        logging.debug("Skipping chainsaw (--skip-chainsaw)")
+
     for tool in tool_runs:
         logging.debug("Prepared %s command: %s", tool.name, tool.command)
 
     return tool_runs
+
+
+def validate_tool_binaries(tool_paths: dict) -> None:
+    """Exit early if any required binary is missing or not executable."""
+    required = ["hayabusa", "chainsaw", "apt_hunter_python"]
+    errors = []
+    for key in required:
+        p = tool_paths.get(key)
+        if p is None:
+            errors.append(f"'{key}' not found in configuration.")
+            continue
+        if not p.exists():
+            errors.append(f"'{key}' binary not found: {p}")
+        elif not os.access(p, os.X_OK):
+            errors.append(f"'{key}' binary is not executable: {p}")
+    if errors:
+        print(colorize("Pre-flight check failed:", COLOR_RED))
+        for err in errors:
+            print(colorize(f"  - {err}", COLOR_RED))
+        sys.exit(1)
+    logging.debug("Pre-flight binary checks passed.")
 
 
 def launch_tools(tools: List[ToolRun]) -> None:
@@ -624,7 +746,11 @@ def launch_tools(tools: List[ToolRun]) -> None:
         tool.process = subprocess.Popen(tool.command, shell=True)
 
 
-def monitor_tools(tools: List[ToolRun], progress_interval: float = 5.0) -> None:
+def monitor_tools(
+    tools: List[ToolRun],
+    progress_interval: float = 5.0,
+    max_timeout_seconds: Optional[int] = None,
+) -> None:
     running = {tool.name for tool in tools}
     finished_order = []
     start_time = time.time()
@@ -644,6 +770,22 @@ def monitor_tools(tools: List[ToolRun], progress_interval: float = 5.0) -> None:
     while any(tool.process and tool.process.poll() is None for tool in tools):
         current_time = time.time()
         elapsed_time = current_time - start_time
+
+        if max_timeout_seconds is not None and elapsed_time > max_timeout_seconds:
+            print(colorize(
+                f"\nTool timeout of {max_timeout_seconds}s reached. Killing remaining processes.",
+                COLOR_RED,
+            ))
+            for tool in tools:
+                if tool.process and tool.process.poll() is None:
+                    tool.process.terminate()
+                    try:
+                        tool.process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        tool.process.kill()
+                    tool.return_code = -signal.SIGTERM
+                    print(colorize(f"  Killed {tool.name}", COLOR_RED))
+            break
 
         for tool in tools:
             if tool.process and tool.process.poll() is not None and tool.name in running:
@@ -715,28 +857,6 @@ def rerun_failed_tools(tools: List[ToolRun], enable_retry: bool) -> List[ToolRun
     return remaining_failures
 
 
-def summarize_csv(path: Path) -> str:
-    try:
-        with path.open("r", encoding="utf-8", errors="ignore") as handle:
-            reader = csv.reader(handle)
-            row_count = sum(1 for _ in reader)
-        if row_count == 0:
-            return "empty CSV"
-        return f"{row_count - 1} records"
-    except OSError:
-        return "unreadable"
-
-
-def summarize_directory(path: Path) -> str:
-    if not path.exists():
-        return "missing"
-    if path.is_file():
-        return human_size(path.stat().st_size)
-    files = [f for f in path.rglob("*") if f.is_file()]
-    total_size = sum(f.stat().st_size for f in files)
-    return f"{len(files)} files ({human_size(total_size)})"
-
-
 def summarize_tools(tools: List[ToolRun]) -> None:
     print("\nSummary")
     for tool in tools:
@@ -763,7 +883,7 @@ def summarize_tools(tools: List[ToolRun]) -> None:
 
 
 def create_archive(target_dir: Path, folder_name: str, report_folder: Path, log_folder: Path) -> Path:
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     archive_path = target_dir / f"{folder_name}_eventlog_bundle_{timestamp}.zip"
     with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zipf:
         for directory in [report_folder, log_folder]:
@@ -869,6 +989,10 @@ def run_llm_summary(
         return None
 
     if not llm_settings.get("enabled", False):
+        print(colorize(
+            "Warning: LLM integration is disabled in configuration, but --llm-summary was requested. Proceeding with stored endpoint.",
+            COLOR_YELLOW,
+        ))
         logging.warning(
             "LLM integration is disabled in configuration, but --llm-summary was requested. Proceeding with stored endpoint."
         )
@@ -948,6 +1072,8 @@ def run_llm_summary(
     summary_path.write_text(content, encoding="utf-8")
     print(f"LLM summary saved to {summary_path}")
     return {"path": str(summary_path), "content": content}
+
+
 def run_update_step(name: str, command: List[str], cwd: Path) -> None:
     logging.info("Updating %s", name)
     logging.debug("Command: %s (cwd=%s)", command, cwd)
@@ -961,15 +1087,28 @@ def run_update_step(name: str, command: List[str], cwd: Path) -> None:
         logging.warning("Command not found while updating %s: %s", name, command[0])
 
 
+def _find_git_root(start: Path) -> Optional[Path]:
+    """Walk up the directory tree to find the first ancestor containing .git or Cargo.toml."""
+    current = start
+    for _ in range(10):
+        if (current / ".git").exists() or (current / "Cargo.toml").exists():
+            return current
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return None
+
+
 def update_tools(tool_paths: dict) -> None:
     hayabusa_bin = tool_paths["hayabusa"].resolve()
-    hayabusa_root = hayabusa_bin.parent
+    hayabusa_root = _find_git_root(hayabusa_bin.parent) or hayabusa_bin.parent
 
     apt_hunter_path = tool_paths["apt_hunter"].resolve()
     apt_hunter_root = apt_hunter_path.parent
 
     chainsaw_bin = tool_paths["chainsaw"].resolve()
-    chainsaw_root = chainsaw_bin.parents[2] if len(chainsaw_bin.parents) >= 3 else chainsaw_bin.parent
+    chainsaw_root = _find_git_root(chainsaw_bin.parent) or chainsaw_bin.parent
 
     sigma_root = tool_paths["sigma"].resolve()
 
@@ -984,9 +1123,13 @@ def update_tools(tool_paths: dict) -> None:
     apt_hunter_python = tool_paths["apt_hunter_python"].resolve()
     if requirements.exists():
         if ".venv" not in str(apt_hunter_python):
+            msg = (
+                f"Skipping APT-Hunter requirements update: interpreter '{apt_hunter_python}' "
+                "does not look like a virtualenv. Create a venv and point the configuration at it."
+            )
+            print(colorize(msg, COLOR_YELLOW))
             logging.warning(
-                "Skipping APT-Hunter requirements update because interpreter %s does not look like a virtualenv."
-                " Create a venv and point the configuration at it to enable automatic dependency installs.",
+                "Skipping APT-Hunter requirements update because interpreter %s does not look like a virtualenv.",
                 apt_hunter_python,
             )
         else:
@@ -1051,8 +1194,9 @@ def main() -> None:
     setup_logging(args.debug, args.debug_log)
     target_dir = resolve_target_directory(args)
     folder_name = target_dir.name
-    config = load_configuration()
+    config = load_configuration(auto=args.auto_config)
     tool_paths = get_tool_paths(config)
+    validate_tool_binaries(tool_paths)
     llm_settings = load_llm_settings(config)
     logging.debug("Using tool paths: %s", tool_paths)
 
@@ -1064,7 +1208,12 @@ def main() -> None:
     ensure_directories(report_folder, log_folder)
     logging.debug("Report folder: %s, Log folder: %s", report_folder, log_folder)
 
-    tools = prepare_tools(target_dir, folder_name, report_folder, log_folder, tool_paths)
+    tools = prepare_tools(
+        target_dir, folder_name, report_folder, log_folder, tool_paths,
+        skip_hayabusa=args.skip_hayabusa,
+        skip_apt_hunter=args.skip_apt_hunter,
+        skip_chainsaw=args.skip_chainsaw,
+    )
 
     if tool_outputs_exist(tools):
         action = handle_existing_outputs(
@@ -1079,7 +1228,7 @@ def main() -> None:
             return
 
     launch_tools(tools)
-    monitor_tools(tools)
+    monitor_tools(tools, max_timeout_seconds=args.tool_timeout)
 
     failed = rerun_failed_tools(tools, args.retry_failed)
     summarize_tools(tools)
@@ -1125,7 +1274,8 @@ def main() -> None:
     if args.archive:
         create_archive(target_dir, folder_name, report_folder, log_folder)
 
-    input("Press Enter to exit...")
+    if sys.stdin.isatty():
+        input("Press Enter to exit...")
 
 
 if __name__ == "__main__":

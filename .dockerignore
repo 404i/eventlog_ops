@@ -1,0 +1,11 @@
+# Keep the context small – only the script and docker/ dir are needed
+older_versions/
+*.evtx
+*.zip
+*.dmg
+*.torrent
+eventlog_operations_output/
+**/__pycache__/
+**/.git/
+*.pyc
+*.pyo

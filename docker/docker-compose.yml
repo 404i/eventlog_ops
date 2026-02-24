@@ -1,0 +1,74 @@
+# ─────────────────────────────────────────────────────────────────────────────
+#  eventlog_ops  –  docker compose
+#
+#  Quick start:
+#    1. Put your EVTX files under ./case_data/
+#    2. docker compose run --rm eventlog-ops
+#
+#  With LLM summarisation:
+#    LLM_ENDPOINT=http://host.docker.internal:1234/v1/chat/completions \
+#    docker compose run --rm eventlog-ops --llm-summary
+#
+#  Build with alternate tool versions:
+#    docker compose build \
+#      --build-arg HAYABUSA_VERSION=3.8.0 \
+#      --build-arg CHAINSAW_VERSION=2.14.1
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  eventlog-ops:
+    build:
+      context: ..            # repo root (one level above docker/)
+      dockerfile: docker/Dockerfile
+      args:
+        HAYABUSA_VERSION: ${HAYABUSA_VERSION:-3.8.0}
+        CHAINSAW_VERSION: ${CHAINSAW_VERSION:-2.14.1}
+    image: eventlog-ops:latest
+    container_name: eventlog-ops
+
+    # Mount your EVTX case directory here.
+    # Outputs land in <case>/eventlog_operations_output/ on the host.
+    volumes:
+      - ${CASE_DIR:-./case_data}:/data
+
+    # ── LLM integration ──────────────────────────────────────────────────────
+    # Set LLM_ENDPOINT to enable the --llm-summary flag.
+    # host.docker.internal resolves to the Docker host on Mac/Windows;
+    # on Linux use the gateway IP (172.17.0.1) or your LLM server address.
+    environment:
+      - LLM_ENDPOINT=${LLM_ENDPOINT:-}
+      - LLM_MODEL=${LLM_MODEL:-}
+      # Ensures non-interactive config bootstrap if the ini is missing.
+      - EVENTLOG_AUTO_CONFIG=1
+
+    # Default flags passed to the script.
+    # Override at runtime: docker compose run eventlog-ops --llm-summary --archive
+    command: ["/data"]
+
+    # ── Resource limits (adjust for your hardware) ───────────────────────────
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 8G
+
+    # Prevent accidental network calls from the analysis container.
+    network_mode: none
+
+  # ── Tool update helper ───────────────────────────────────────────────────
+  # Run this service to pull the latest rules/signatures into the image:
+  #   docker compose run --rm update-tools
+  update-tools:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: eventlog-ops:latest
+    volumes:
+      - ${CASE_DIR:-./case_data}:/data
+    environment:
+      - EVENTLOG_AUTO_CONFIG=1
+    network_mode: host          # needs internet access for git pull
+    entrypoint: ["python3", "/app/eventlog_operations_v4.py"]
+    command: ["--update-tools", "--help"]
+    # Note: --update-tools updates rules inside the running container only.
+    # Rebuild the image to persist updated rules across container restarts.
